@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PharmaNear – find medicine close to you</title>
+<!-- For production, replace the Tailwind CDN with a compiled CSS file (npx tailwindcss -m) to cut data use. -->
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+</head>
+<body class="bg-white text-slate-950 text-lg antialiased">
+<header class="bg-emerald-900 text-white px-4 py-4">
+  <h1 class="text-2xl font-extrabold">PharmaNear</h1>
+  <p class="text-emerald-100">Find stock at the closest pharmacy and reserve it.</p>
+</header>
+
+<main class="max-w-2xl mx-auto p-4 space-y-4">
+  <form id="searchForm" class="space-y-3">
+    <label for="q" class="font-bold block">Medicine name</label>
+    <input id="q" type="search" autocomplete="off" inputmode="search" placeholder="e.g. Paracetamol"
+      class="w-full border-2 border-slate-950 rounded-lg px-4 py-3 text-lg focus:outline-none focus:ring-4 focus:ring-amber-400">
+    <button class="w-full bg-emerald-900 text-white font-bold rounded-lg py-3 focus:ring-4 focus:ring-amber-400">Search</button>
+  </form>
+
+  <section class="border-2 border-slate-950 rounded-lg p-3 space-y-2">
+    <p id="locStatus" class="font-semibold" role="status">Location not set.</p>
+    <div class="flex gap-2">
+      <button id="locBtn" class="flex-1 bg-amber-400 text-slate-950 font-bold rounded-lg py-3 focus:ring-4 focus:ring-emerald-900">Use my location</button>
+      <select id="townSel" aria-label="Choose town manually" class="flex-1 border-2 border-slate-950 rounded-lg px-2 py-3 bg-white">
+        <option value="">Or pick a town</option>
+      </select>
+    </div>
+  </section>
+
+  <div id="map" class="h-56 rounded-lg border-2 border-slate-950" aria-label="Map of pharmacies"></div>
+  <div id="results" class="space-y-3" aria-live="polite"></div>
+</main>
+
+<!-- Order sheet -->
+<dialog id="orderDlg" class="w-[92%] max-w-md rounded-xl p-0 border-2 border-slate-950">
+  <form id="orderForm" class="p-4 space-y-3">
+    <h2 id="orderTitle" class="text-xl font-extrabold"></h2>
+    <p id="orderSub" class="text-slate-700"></p>
+    <label class="block font-bold">Quantity
+      <input name="qty" type="number" min="1" max="20" value="1" inputmode="numeric" required class="w-full border-2 border-slate-950 rounded-lg px-3 py-3"></label>
+    <label class="block font-bold">Your name
+      <input name="name" required maxlength="80" autocomplete="name" class="w-full border-2 border-slate-950 rounded-lg px-3 py-3"></label>
+    <label class="block font-bold">Phone number
+      <input name="phone" type="tel" required inputmode="tel" autocomplete="tel" placeholder="07XXXXXXXX" class="w-full border-2 border-slate-950 rounded-lg px-3 py-3"></label>
+    <p id="orderMsg" class="font-bold" role="alert"></p>
+    <div class="flex gap-2">
+      <button type="button" id="cancelOrder" class="flex-1 border-2 border-slate-950 rounded-lg py-3 font-bold">Close</button>
+      <button class="flex-1 bg-emerald-900 text-white rounded-lg py-3 font-bold">Reserve</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const $ = id => document.getElementById(id);
+let rows = [], origin = null, map, layer, youMarker, pending = null;
+
+/* Haversine distance in km */
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371, rad = d => d * Math.PI / 180;
+  const dLat = rad(lat2 - lat1), dLon = rad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+map = L.map('map').setView([-1.286, 36.817], 11);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom: 18, attribution: '&copy; OpenStreetMap'}).addTo(map);
+layer = L.layerGroup().addTo(map);
+
+async function load() {
+  const r = await fetch('api.php?action=stock&q=' + encodeURIComponent($('q').value.trim()));
+  const d = await r.json();
+  rows = d.rows;
+  if ($('townSel').options.length === 1)
+    d.towns.forEach(t => $('townSel').add(new Option(t.town, JSON.stringify([t.lat, t.lng]))));
+  render();
+}
+
+function setOrigin(lat, lng, label) {
+  origin = [lat, lng];
+  $('locStatus').textContent = 'Showing nearest to: ' + label;
+  if (youMarker) youMarker.remove();
+  youMarker = L.circleMarker(origin, {radius: 9, color: '#000', fillColor: '#fbbf24', fillOpacity: 1}).addTo(map).bindPopup('You');
+  render();
+}
+
+function render() {
+  // group rows by pharmacy
+  const g = new Map();
+  rows.forEach(r => {
+    if (!g.has(r.pid)) g.set(r.pid, {...r, dist: origin ? haversine(origin[0], origin[1], r.lat, r.lng) : null, items: []});
+    g.get(r.pid).items.push(r);
+  });
+  const list = [...g.values()].sort((a, b) => origin ? a.dist - b.dist : a.pharmacy.localeCompare(b.pharmacy));
+  layer.clearLayers();
+  const pts = [];
+  list.forEach(p => { L.marker([p.lat, p.lng]).addTo(layer).bindPopup(p.pharmacy); pts.push([p.lat, p.lng]); });
+  if (origin) pts.push(origin);
+  if (pts.length) map.fitBounds(pts, {padding: [30, 30], maxZoom: 15});
+
+  $('results').innerHTML = list.length ? '' : '<p class="font-bold">No pharmacy stocks that medicine. Try another spelling.</p>';
+  list.forEach(p => {
+    const div = document.createElement('article');
+    div.className = 'border-2 border-slate-950 rounded-lg p-3';
+    const head = document.createElement('div');
+    head.innerHTML = `<h3 class="text-xl font-extrabold"></h3><p class="text-slate-700"></p>`;
+    head.children[0].textContent = p.pharmacy;
+    head.children[1].textContent = `${p.street}, ${p.town}` + (p.dist != null ? ` • ${p.dist.toFixed(1)} km away` : '');
+    div.append(head);
+    p.items.forEach(i => {
+      const row = document.createElement('div');
+      row.className = 'flex items-center justify-between gap-2 border-t border-slate-300 mt-2 pt-2';
+      const t = document.createElement('div');
+      t.innerHTML = '<p class="font-bold"></p><p class="text-base"></p>';
+      t.children[0].textContent = `${i.medicine} ${i.strength}`.trim();
+      t.children[1].textContent = `KES ${i.price} • ${i.quantity > 0 ? i.quantity + ' in stock' : 'Out of stock'}`;
+      const b = document.createElement('button');
+      b.textContent = 'Reserve'; b.disabled = i.quantity < 1;
+      b.className = 'bg-emerald-900 text-white font-bold rounded-lg px-4 py-3 disabled:bg-slate-300 disabled:text-slate-700 focus:ring-4 focus:ring-amber-400';
+      b.onclick = () => openOrder(p, i);
+      row.append(t, b); div.append(row);
+    });
+    const call = document.createElement('a');
+    call.href = 'tel:' + p.phone; call.textContent = 'Call ' + p.phone;
+    call.className = 'inline-block mt-2 underline font-bold text-emerald-900';
+    div.append(call);
+    $('results').append(div);
+  });
+}
+
+function openOrder(p, i) {
+  pending = {pharmacy_id: p.pid, medicine_id: i.mid};
+  $('orderTitle').textContent = `${i.medicine} ${i.strength}`.trim();
+  $('orderSub').textContent = `${p.pharmacy} • KES ${i.price} each`;
+  $('orderForm').qty.max = Math.min(20, i.quantity);
+  $('orderMsg').textContent = '';
+  $('orderDlg').showModal();
+}
+
+$('orderForm').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {...pending, qty: +f.qty.value, name: f.name.value, phone: f.phone.value};
+  const r = await fetch('api.php?action=order', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if (d.ok) {
+    $('orderMsg').textContent = `Reserved. Order #${d.order_id}, total KES ${d.total}. Pay and collect at the pharmacy.`;
+    load();
+  } else $('orderMsg').textContent = d.error;
+};
+$('cancelOrder').onclick = () => $('orderDlg').close();
+$('searchForm').onsubmit = e => { e.preventDefault(); load(); };
+$('townSel').onchange = e => {
+  if (!e.target.value) return;
+  const [la, ln] = JSON.parse(e.target.value);
+  setOrigin(la, ln, e.target.selectedOptions[0].text);
+};
+$('locBtn').onclick = () => {
+  if (!navigator.geolocation) { $('locStatus').textContent = 'Location not supported. Pick a town instead.'; return; }
+  $('locStatus').textContent = 'Finding you…';
+  navigator.geolocation.getCurrentPosition(
+    p => setOrigin(p.coords.latitude, p.coords.longitude, 'your location'),
+    () => $('locStatus').textContent = 'Location blocked. Pick a town below instead.',
+    {enableHighAccuracy: false, timeout: 10000, maximumAge: 300000});
+};
+load();
+</script>
+</body>
+</html>
